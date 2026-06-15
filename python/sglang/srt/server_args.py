@@ -2799,6 +2799,8 @@ class ServerArgs:
                 "Qwen3_5MoeForConditionalGeneration",
                 "InternS2PreviewForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
+                "NemotronHForCausalLM",
+                "NemotronHPuzzleForCausalLM",
             ]
             and (is_sm90_supported() or is_sm100_supported())
             and self.tp_size > 1
