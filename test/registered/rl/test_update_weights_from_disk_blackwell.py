@@ -158,6 +158,7 @@ class UpdateWeightsFromDiskBase:
 
 class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTestCase):
     model = "zianglih/Qwen3-30B-A3B-Instruct-2507-MXFP8-last-8-BF16"
+    launch_env = {"SGLANG_FLASHINFER_AUTOTUNE_CACHE": "0"}
     backend_test_suites = (
         {
             "name": "flashinfer_trtllm_routed_mxfp8",
