@@ -2,8 +2,7 @@ from typing import Optional, Union, Tuple, List
 
 import torch
 import torch.nn as nn
-from layers.vocab_parallel_embedding import VocabParallelEmbedding, ParallelLMHead
-from sglang.multimodal_gen.runtime.layers.linear import MergedColumnParallelLinear
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding, ParallelLMHead
 
 from transformers import LlamaConfig
 
@@ -11,7 +10,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput, LogitsProcessor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -72,7 +71,8 @@ class Llama3CustomAttention(nn.Module):
 
 
 class Llama3CustomMLP(nn.Module):
-    def __init__(self, config: LlamaConfig)
+    def __init__(self, config: LlamaConfig):
+        super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
             [config.intermediate_size] * 2,
