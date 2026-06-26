@@ -36,15 +36,28 @@ print(f'✅ LlamaConfig 创建成功 (hidden={config.hidden_size}, layers={confi
 print('\n===== 基本验证全部通过 =====')
 print('实例化测试需要在有 GPU 的机器上运行。')
 
-# ---- 以下在 GPU 机器上取消注释 ----
+# ---- 以下在 GPU 机器上运行（需要指定一个真实的模型路径） ----
+# 用法: MODEL_PATH=/path/to/Llama-3-8B python test_init.py
+import os
+import sys
+
+MODEL_PATH = os.environ.get("MODEL_PATH")
+if MODEL_PATH is None:
+    print("\n💡 完整测试需要 GPU + 真实模型路径。用法：")
+    print("   MODEL_PATH=/path/to/model python test_init.py")
+    print("   例如: MODEL_PATH=meta-llama/Llama-3.2-1B python test_init.py")
+    sys.exit(0)
+
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.distributed import init_distributed_environment, initialize_model_parallel
 
-server_args = ServerArgs(model_path="/path/to/model", disable_cuda_graph=True)
+print(f"\n📦 加载模型配置: {MODEL_PATH}")
+server_args = ServerArgs(model_path=MODEL_PATH, disable_cuda_graph=True)
 set_global_server_args_for_scheduler(server_args)
 init_distributed_environment(world_size=1, rank=0,
     distributed_init_method="tcp://127.0.0.1:23456", local_rank=0, backend="nccl")
 initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
 
+print("🔨 实例化模型...")
 model = cls(config)
-print(f'init success, parameter quantity: {sum(p.numel() for p in model.parameters()):,}')
+print(f'\n✅ init success, parameter quantity: {sum(p.numel() for p in model.parameters()):,}')
