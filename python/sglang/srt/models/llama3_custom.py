@@ -169,7 +169,7 @@ class Llama3CustomForCausalLM(nn.Module):
                 input_ids: torch.Tensor,
                 positions: torch.Tensor,
                 forward_batch: ForwardBatch,
-                input_embeds: torch.Tensor,
+                input_embeds: torch.Tensor = None,
                 get_embedding: bool = False,
                 pp_proxy_tensors: Optional[PPProxyTensors] = None
     ) -> LogitsProcessorOutput:
