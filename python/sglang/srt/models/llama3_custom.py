@@ -14,8 +14,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput, LogitsProc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.distributed import get_pp_group
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.layers.pooler import Pooler, PoolingType
 
 
 class Llama3CustomAttention(nn.Module):
