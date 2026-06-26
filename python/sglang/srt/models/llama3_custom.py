@@ -3,9 +3,7 @@ from typing import Optional, Union, Tuple, List
 import torch
 import torch.nn as nn
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding, ParallelLMHead
-
 from transformers import LlamaConfig
-
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -14,6 +12,10 @@ from sglang.srt.layers.linear import MergedColumnParallelLinear, QKVParallelLine
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput, LogitsProcessor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.distributed import get_pp_group
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.layers.pooler import Pooler, PoolingType
 
 
 class Llama3CustomAttention(nn.Module):
@@ -131,7 +133,9 @@ class Llama3CustomForCausalLM(nn.Module):
     整合词嵌入、多层Transformer、归一化及语言模型头，用于自回归文本生成。
     """
     def __init__(self,
-                 config: LlamaConfig) -> None:
+                 config: LlamaConfig,
+                 quant_config: Optional[QuantizationConfig] = None,
+                 prefix: str = "") -> None:
         """
         初始化Llama3CustomForCausalLM模型的所有子模块。
 
@@ -140,7 +144,9 @@ class Llama3CustomForCausalLM(nn.Module):
                     Transformer层数、RMSNorm epsilon等。
         """
         super().__init__()
+        self.pp_group = get_pp_group()
         self.config = config
+        self.quant_config = quant_config
         # 词嵌入层
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         # Transformer layers
@@ -152,6 +158,14 @@ class Llama3CustomForCausalLM(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
+        # 权重名称映射：checkpoint中的分片名 -> 模型中的融合参数名
+        self.stacked_params_mapping = [
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+        ]
 
     def forward(self,
                 input_ids: torch.Tensor,
@@ -174,19 +188,31 @@ class Llama3CustomForCausalLM(nn.Module):
     def load_weights(self, weights):
         """
         权重加载:
-        Checkpoint = 训练好的模型文件包，包含配置（怎么搭模型）和权重（模型参数数值）。
-        sglang 的工作就是把这个包读进来，重建模型结构，填入权重数据，然后执行推理。你在
-        load_weights里看到的所有逻辑（名字映射、融合参数、PP过滤等），本质上就是在处理checkpoint中的张量名和模型参数名之间的差异。
-
-        在权重加载场景中必须用 named_parameters()，因为需要靠名字来匹配 checkpoint 中的权重和模型中的参数。
+        将checkpoint中的分片参数(q_proj, k_proj, v_proj)映射到模型中的融合参数(qkv_proj)。
+        同理 gate_proj + up_proj → gate_up_proj。
         """
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if "rotary_emb" in name:
                 continue
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
+            # 处理checkpoint分片名 -> 模型融合参数名的映射
+            for param_name, weight_name, shard_id in self.stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                if name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # 不需要映射的直接加载
+                if name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
 
 
 EntryClass = [
