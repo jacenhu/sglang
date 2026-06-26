@@ -3,6 +3,7 @@ from typing import Optional, Union, Tuple, List
 import torch
 import torch.nn as nn
 from layers.vocab_parallel_embedding import VocabParallelEmbedding, ParallelLMHead
+from sglang.multimodal_gen.runtime.layers.linear import MergedColumnParallelLinear
 
 from transformers import LlamaConfig
 
@@ -70,6 +71,28 @@ class Llama3CustomAttention(nn.Module):
         return output
 
 
+class Llama3CustomMLP(nn.Module):
+    def __init__(self, config: LlamaConfig)
+        self.gate_up_proj = MergedColumnParallelLinear(
+            config.hidden_size,
+            [config.intermediate_size] * 2,
+            bias = False,
+        )
+
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
+            bias = False,
+        )
+
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x, forward_batch = None):
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
 class Llama3CustomDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_id: int):
         super().__init__()
@@ -80,10 +103,7 @@ class Llama3CustomDecoderLayer(nn.Module):
         )
 
         # 2. Llama前馈网络SwiGLU
-        self.mlp = SiluAndMul(
-            hidden_size = config.hidden_size,
-            intermediate_size = config.intermediate_size
-        )
+        self.mlp = Llama3CustomMLP(config)
 
         # 3. 前后2次RMS归一化
         self.input_layernorm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
