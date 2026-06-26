@@ -23,18 +23,24 @@ config = LlamaConfig(
 cls, _ = ModelRegistry.resolve_model_cls('Llama3CustomForCausalLM')
 model = cls(config)
 
+# 搬到 GPU
+assert torch.cuda.is_available(), "需要 CUDA GPU"
+device = torch.device("cuda")
+model = model.to(device)
+model.eval()
+
 # 模拟一次推理
 batch_size = 1
 hidden_size = config.hidden_size
-input_ids = torch.randint(0, 1000, (batch_size, 1))
-positions = torch.zeros(batch_size, 1, dtype=torch.long)
+input_ids = torch.randint(0, 1000, (batch_size, 1), device=device)
+positions = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
 forward_batch = ForwardBatch(
     forward_mode=ForwardMode.DECODE,
     batch_size=batch_size,
     input_ids=input_ids,
-    req_pool_indices=torch.zeros(batch_size, dtype=torch.int32),
-    seq_lens=torch.ones(batch_size, dtype=torch.int32),
-    out_cache_loc=torch.zeros(batch_size, dtype=torch.int64),
+    req_pool_indices=torch.zeros(batch_size, dtype=torch.int32, device=device),
+    seq_lens=torch.ones(batch_size, dtype=torch.int32, device=device),
+    out_cache_loc=torch.zeros(batch_size, dtype=torch.int64, device=device),
     seq_lens_sum=batch_size,
     return_logprob=False,
 )
