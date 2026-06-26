@@ -180,7 +180,7 @@ class Llama3CustomForCausalLM(nn.Module):
             hidden_stats = layer(hidden_stats, positions, forward_batch)
         # 3. 最后归一化，输出每个token的预测概率
         hidden_stats = self.norm(hidden_stats)
-        logits = self.logits_processor(input_ids, hidden_stats, self.lm_head)
+        logits = self.logits_processor(input_ids, hidden_stats, self.lm_head, forward_batch)
         return logits
 
     def load_weights(self, weights):
