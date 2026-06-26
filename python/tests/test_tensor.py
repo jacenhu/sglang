@@ -1,7 +1,17 @@
 import torch
 from transformers import LlamaConfig
 from sglang.srt.models.registry import ModelRegistry
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.distributed import init_distributed_environment, initialize_model_parallel
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+
+# 初始化运行时环境（GPU 机器需要）
+server_args = ServerArgs(model_path="/root/autodl-tmp/models/LLM-Research/Meta-Llama-3.1-8B-Instruct",
+                         disable_cuda_graph=True)
+set_global_server_args_for_scheduler(server_args)
+init_distributed_environment(world_size=1, rank=0,
+    distributed_init_method="tcp://127.0.0.1:23456", local_rank=0, backend="nccl")
+initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
 
 config = LlamaConfig(
     vocab_size=1000, hidden_size=64, intermediate_size=256,
