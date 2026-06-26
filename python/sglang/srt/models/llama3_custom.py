@@ -2,6 +2,7 @@ from typing import Optional, Union, Tuple, List
 
 import torch
 import torch.nn as nn
+from layers.vocab_parallel_embedding import VocabParallelEmbedding, ParallelLMHead
 
 from transformers import LlamaConfig
 
@@ -9,31 +10,33 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput, LogitsProcessor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
-class Llama3CustomModel(nn.Module):
-    def __init__(self, config: LlamaConfig) -> None:
+
+class Llama3CustomAttention(nn.Module):
+    def __init__(self, config: LlamaConfig, layer_id):
         super().__init__()
+        self.layer_id = layer_id
+        self.num_heads = config.num_attention_heads
 
-    def forward(self,
-                input_ids: torch.Tensor,
-                positions: torch.Tensor,
-                forward_batch: ForwardBatch,
-                input_embeds: torch.Tensor,
-                get_embedding: bool = False,
-                pp_proxy_tensors: Optional[PPProxyTensors] = None
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor], PPProxyTensors]]:
-        return
+        self.atten = RadixAttention(
+            num_heads = config.num_heads,
+            head_dim =
+            scaling =
+            num_kv_heads = config.num_key_value_heads,
+            layer_id = layer_id
+        )
 
-class Llama3CustomLayer(nn.Module):
+
+
+class Llama3CustomDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_id: int):
         super().__init__()
         #1. 初始化注意力层
-        self.self_atten = RadixAttention(
-            num_heads = config.num_attention_heads,
-            num_kv_heads = config.num_key_value_heads,
-            layer_id = layer_id,
+        self.self_atten = Llama3CustomAttention(
+            config,
+            layer_id
         )
 
         # 2. Llama前馈网络SwiGLU
@@ -46,11 +49,11 @@ class Llama3CustomLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
 
-    def forward(self, hidden_states, positions, input_metadata):
+    def forward(self, hidden_states, positions, forward_batch):
         # 前置归一化 -> 自注意力 + 残差连接
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_atten(hidden_states, positions, input_metadata)
+        hidden_states = self.self_atten(hidden_states, positions, forward_batch)
         hidden_states += residual
 
         # 注意力输出后归一化 -> 前馈网络 + 残差连接
@@ -63,27 +66,32 @@ class Llama3CustomLayer(nn.Module):
 
 
 class Llama3CustomForCausalLM(nn.Module):
+    """
+    基于Llama3架构的自定义因果语言模型。
+    整合词嵌入、多层Transformer、归一化及语言模型头，用于自回归文本生成。
+    """
     def __init__(self,
                  config: LlamaConfig) -> None:
+        """
+        初始化Llama3CustomForCausalLM模型的所有子模块。
+
+        Args:
+            config: LlamaConfig，模型超参数配置，包含词表大小、隐藏层维度、
+                    Transformer层数、RMSNorm epsilon等。
+        """
         super().__init__()
-        self.model = self._init_model(config)
         self.config = config
         # 词嵌入层
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        # Transformer层
+        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        # Transformer layers
         self.layers = nn.ModuleList([
-            Llama3CustomLayer(config, layer_id = i)
+            Llama3CustomDecoderLayer(config, layer_id = i)
             for i in range(config.num_hidden_layers)
         ])
-        # 最后一层归一化
+        # 归一化和线性变换
         self.norm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
-        # 输出层，把特征向量映射为词表概率
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-    def _init_model(self,
-                    config: LlamaConfig):
-        return Llama3CustomModel(config)
-
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        self.logits_processor = LogitsProcessor(config)
 
     def forward(self,
                 input_ids: torch.Tensor,
@@ -100,7 +108,7 @@ class Llama3CustomForCausalLM(nn.Module):
             hidden_stats = layer(hidden_stats, positions, forward_batch)
         # 3. 最后归一化，输出每个token的预测概率
         hidden_stats = self.norm(hidden_stats)
-        logits = self.lm_head(hidden_stats)
+        logits = self.logits_processor(input_ids, hidden_stats, self.lm_head)
         return logits
 
     def load_weights(self, weights):
