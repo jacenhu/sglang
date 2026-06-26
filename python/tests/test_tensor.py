@@ -33,10 +33,9 @@ forward_batch = ForwardBatch(
     batch_size=batch_size,
     input_ids=input_ids,
     req_pool_indices=torch.zeros(batch_size, dtype=torch.int32),
-    req_to_token_pool=None,
-    out_cache_loc=torch.zeros(batch_size, dtype=torch.int64),
     seq_lens=torch.ones(batch_size, dtype=torch.int32),
-    extend_seq_lens=None,
+    out_cache_loc=torch.zeros(batch_size, dtype=torch.int64),
+    seq_lens_sum=batch_size,
     return_logprob=False,
 )
 
