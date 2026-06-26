@@ -19,6 +19,7 @@ config = LlamaConfig(
     num_hidden_layers=2, rms_norm_eps=1e-5,
     architectures=['Llama3CustomForCausalLM']
 )
+config.torch_dtype = torch.float16
 
 cls, _ = ModelRegistry.resolve_model_cls('Llama3CustomForCausalLM')
 model = cls(config)
@@ -26,7 +27,7 @@ model = cls(config)
 # 搬到 GPU
 assert torch.cuda.is_available(), "需要 CUDA GPU"
 device = torch.device("cuda")
-model = model.to(device)
+model = model.to(device=device, dtype=torch.float16)
 model.eval()
 
 # 模拟一次推理
