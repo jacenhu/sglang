@@ -10,6 +10,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
+from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput, LogitsProcessor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
@@ -19,15 +21,53 @@ class Llama3CustomAttention(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
 
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.scaling = self.head_dim ** -0.5
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+
+        # QKV融合投影层
+        self.qkv_proj = QKVParallelLinear(
+            config.hidden_size,
+            self.head_dim,
+            self.num_heads,
+            self.num_kv_heads,
+            bias=False,
+        )
+        # 输出投影层
+        self.o_proj = RowParallelLinear(
+            self.num_heads * self.head_dim,
+            config.hidden_size,
+            bias=False,
+        )
+        # 旋转位置编码
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=getattr(config, "max_position_embeddings", 8192),
+            base=getattr(config, "rope_theta", 10000),
+        )
         self.atten = RadixAttention(
-            num_heads = config.num_heads,
-            head_dim =
-            scaling =
+            num_heads = config.num_attention_heads,
+            head_dim = self.head_dim,
+            scaling = self.scaling,
             num_kv_heads = config.num_key_value_heads,
             layer_id = layer_id
         )
 
+    def forward(self, hidden_states, positions, forward_batch):
+        # 1. 隐藏状态投影为Q、K、V
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # 2. 对Q、K施加旋转位置编码
+        q, k = self.rotary_emb(positions, q, k)
+        # 3. 注意力计算
+        attn_output = self.atten(q, k, v, forward_batch)
+        # 4. 输出投影
+        output, _ = self.o_proj(attn_output)
+        return output
 
 
 class Llama3CustomDecoderLayer(nn.Module):
