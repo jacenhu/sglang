@@ -68,6 +68,15 @@ if _is_npu:
 
 
 class LlamaMLP(nn.Module):
+    """
+    SwiGLU 前馈网络层。
+
+    使用融合的 gate/up 投影（gate_proj 和 up_proj 拼接为一个 MergedColumnParallelLinear），
+    然后通过 SiLU 门控激活和 down 投影。
+
+    计算流程: x -> gate_up_proj -> SiLU(gate) * up -> down_proj
+    """
+
     def __init__(
         self,
         hidden_size: int,
@@ -80,6 +89,18 @@ class LlamaMLP(nn.Module):
         tp_size: Optional[int] = None,
         use_dp_attention_reduce: bool = False,
     ) -> None:
+        """
+        Args:
+            hidden_size: 输入/输出的隐藏维度。
+            intermediate_size: 中间层维度（FFN 扩展维度）。
+            hidden_act: 激活函数名称，当前仅支持 "silu"。
+            quant_config: 量化配置，为 None 时使用浮点精度。
+            prefix: 权重名称前缀，用于参数命名和状态字典匹配。
+            reduce_results: 是否在 down_proj 后进行 all-reduce。
+            tp_rank: 当前 TP rank，为 None 时自动获取。
+            tp_size: TP 总大小，为 None 时自动获取。
+            use_dp_attention_reduce: 是否使用 DP attention 的 reduce 路径。
+        """
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -114,6 +135,15 @@ class LlamaMLP(nn.Module):
         forward_batch=None,
         use_reduce_scatter: bool = False,
     ):
+        """
+        Args:
+            x: 输入张量，shape 为 [num_tokens, hidden_size]。
+            forward_batch: 前向批次信息，用于 TP/DP 通信上下文。
+            use_reduce_scatter: 是否跳过 all-reduce（用于 reduce-scatter 优化路径）。
+
+        Returns:
+            输出张量，shape 为 [num_tokens, hidden_size]。
+        """
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(
@@ -124,6 +154,16 @@ class LlamaMLP(nn.Module):
 
 
 class LlamaAttention(nn.Module):
+    """
+    LLaMA 自注意力层。
+
+    使用融合的 QKV 投影（QKVParallelLinear）以及分组查询注意力（GQA）。
+    在 TP 环境下，Q 头按 TP size 等分，KV 头根据需要分区或复制。
+    支持原生 CUDA 后端和 NPU 后端（通过融合的 rmsnorm + rope kernel）。
+
+    计算流程: hidden -> QKV proj -> split -> RoPE -> RadixAttention -> O proj
+    """
+
     def __init__(
         self,
         config: LlamaConfig,
@@ -140,6 +180,22 @@ class LlamaAttention(nn.Module):
         prefix: str = "",
         bias: bool = False,
     ) -> None:
+        """
+        Args:
+            config: HuggingFace LlamaConfig，包含模型超参数。
+            hidden_size: 输入的隐藏维度。
+            num_heads: 总的 Query 注意力头数。
+            num_kv_heads: 总的 Key/Value 注意力头数（GQA 时小于 num_heads）。
+            layer_id: 当前层在 Transformer 中的索引。
+            start_layer: PP 分片中的起始层索引。
+            rope_theta: RoPE 的基础频率。
+            rope_scaling: RoPE 缩放配置（如 YaRN）。
+            rope_is_neox_style: 是否使用 Neox 风格的 RoPE。
+            max_position_embeddings: 最大位置编码长度。
+            quant_config: 量化配置。
+            prefix: 权重名称前缀。
+            bias: 是否在 QKV 和 O 投影中使用偏置。
+        """
         super().__init__()
         self.hidden_size = hidden_size
         self.start_layer = start_layer
@@ -205,12 +261,35 @@ class LlamaAttention(nn.Module):
         )
 
     def forward_prepare_native(self, positions, hidden_states):
+        """
+        原生 CUDA/xpu 后端的 QKV 准备：投影 + 拆分 + RoPE。
+
+        Args:
+            positions: 位置编码张量。
+            hidden_states: 输入隐藏状态，shape [num_tokens, hidden_size]。
+
+        Returns:
+            (q, k, v) 三元组，每个 shape 为 [num_tokens, per_TP_heads * head_dim]。
+        """
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
+        """
+        NPU 后端的 QKV 准备：使用融合的 rmsnorm+rope kernel。
+
+        仅在首层（start_layer）预计算 cos/sin 以复用给后续层。
+
+        Args:
+            positions: 位置编码张量。
+            hidden_states: 输入隐藏状态。
+            forward_batch: 前向批次信息。
+
+        Returns:
+            (q, k, v) 三元组。
+        """
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn.layer_id == self.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
@@ -231,6 +310,20 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        """
+        注意力层前向传播。
+
+        根据后端类型选择 QKV 准备路径（原生或 NPU 融合），然后执行
+        RadixAttention 和输出投影。
+
+        Args:
+            positions: token 位置索引，shape [num_tokens]。
+            hidden_states: 输入隐藏状态，shape [num_tokens, hidden_size]。
+            forward_batch: 前向批次元数据（ForwardMode、KV cache 信息等）。
+
+        Returns:
+            注意力输出，shape [num_tokens, hidden_size]。
+        """
         if (
             not _is_npu
             or not hasattr(self.rotary_emb, "get_cos_sin_with_position")
@@ -253,6 +346,15 @@ class LlamaAttention(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
+    """
+    LLaMA 解码器层。
+
+    包含 Pre-Norm 结构：input_layernorm -> self_attention (+residual)
+    -> post_attention_layernorm -> MLP (+residual)。
+
+    使用 fused RMSNorm(residual) 模式优化残差连接的内存和计算。
+    """
+
     def __init__(
         self,
         config: LlamaConfig,
@@ -261,6 +363,14 @@ class LlamaDecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
+        """
+        Args:
+            config: LlamaConfig 模型配置。
+            layer_id: 当前层的全局索引。
+            start_layer: PP 分片中当前 rank 的起始层索引。
+            quant_config: 量化配置。
+            prefix: 权重名称前缀。
+        """
         super().__init__()
         self.hidden_size = config.hidden_size
         rope_parameters = getattr(config, "rope_parameters", None)
@@ -317,6 +427,21 @@ class LlamaDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        解码器层前向传播。
+
+        支持 fused residual 模式：当 residual 非 None 时，RMSNorm 同时
+        返回归一化后的 hidden_states 和更新后的 residual。
+
+        Args:
+            positions: token 位置索引。
+            hidden_states: 输入隐藏状态。
+            forward_batch: 前向批次元数据。
+            residual: 残差张量。首层为 None，后续层非 None。
+
+        Returns:
+            (hidden_states, residual) 二元组。
+        """
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -336,12 +461,26 @@ class LlamaDecoderLayer(nn.Module):
 
 
 class LlamaModel(nn.Module):
+    """
+    LLaMA Transformer 骨干网络。
+
+    包含词嵌入层、多层 LlamaDecoderLayer 和最终 RMSNorm。
+    支持 Pipeline Parallelism（PP）：非首 rank 使用 PPMissingLayer 作为占位，
+    通过 PPProxyTensors 传递中间结果。
+    """
+
     def __init__(
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
+        """
+        Args:
+            config: LlamaConfig 模型配置。
+            quant_config: 量化配置。
+            prefix: 权重名称前缀。
+        """
         super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
@@ -390,6 +529,27 @@ class LlamaModel(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]], PPProxyTensors]:
+        """
+        Transformer 骨干前向传播。
+
+        支持 PP：首 rank 执行 embedding -> layers；中间 rank 接收
+        PPProxyTensors -> layers -> PPProxyTensors；末 rank 执行
+        layers -> RMSNorm -> hidden_states。
+
+        当 capture_aux_hidden_states 启用时，返回 (hidden_states, aux_hidden_states)。
+
+        Args:
+            input_ids: 输入 token ID，shape [num_tokens]。
+            positions: token 位置索引。
+            forward_batch: 前向批次信息。
+            input_embeds: 可选的预计算输入嵌入，优先级高于 input_ids。
+            pp_proxy_tensors: PP 中间结果张量（非首 rank 必需）。
+
+        Returns:
+            - 末 rank 无 aux: hidden_states tensor
+            - 末 rank 有 aux: (hidden_states, aux_hidden_states) 元组
+            - 非末 rank: PPProxyTensors
+        """
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -430,10 +590,19 @@ class LlamaModel(nn.Module):
 
         return hidden_states, aux_hidden_states
 
-    # If this function is called, it should always initialize KV cache scale
-    # factors (or else raise an exception). Thus, handled exceptions should
-    # make sure to leave KV cache scale factors in a known good (dummy) state
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        """
+        从量化参数文件中加载 KV cache 缩放因子。
+
+        遍历所有 attention 层，将缩放因子写入 attn.k_scale 和 attn.v_scale。
+        调用方需确保异常后缩放因子保持在已知的合法状态。
+
+        Args:
+            quantization_param_path: 量化参数文件路径。
+
+        Raises:
+            RuntimeError: 某层的 attention 对象缺少 k_scale 属性。
+        """
         tp_size = get_parallel().tp_size
         tp_rank = get_parallel().tp_rank
         for layer_idx, scaling_factor in kv_cache_scales_loader(
@@ -455,11 +624,24 @@ class LlamaModel(nn.Module):
                 )
 
     def get_input_embeddings(self) -> nn.Embedding:
-        """Get input embeddings from the model."""
+        """获取模型的输入词嵌入层。"""
         return self.embed_tokens
 
 
 class LlamaForCausalLM(nn.Module):
+    """
+    LLaMA 因果语言模型（推理专用）。
+
+    聚合 LlamaModel 骨干、lm_head 投影层和 logits 处理器。
+    支持 PP（Pipeline Parallelism）、词嵌入权重共享、
+    EAGLE3/DLFlash 辅助隐藏状态捕获。
+
+    类属性（BitsAndBytes 量化兼容）:
+        default_bitsandbytes_target_modules: 默认的量化目标模块名称模式。
+        column_parallel_weights_modules: 按列维度做 TP 切分的权重模块。
+        bitsandbytes_stacked_params_mapping: 融合参数与分片名称的映射。
+    """
+
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -487,6 +669,12 @@ class LlamaForCausalLM(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
+        """
+        Args:
+            config: LlamaConfig 模型配置。
+            quant_config: 量化配置。
+            prefix: 权重名称前缀。
+        """
         super().__init__()
         self.pp_group = get_pp_group()
         self.config = config
@@ -523,6 +711,19 @@ class LlamaForCausalLM(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
+        """
+        初始化 LlamaModel 骨干网络。
+
+        子类可覆写此方法来使用不同的骨干实现。
+
+        Args:
+            config: 模型配置。
+            quant_config: 量化配置。
+            prefix: 权重名称前缀。
+
+        Returns:
+            LlamaModel 实例。
+        """
         return LlamaModel(config, quant_config=quant_config, prefix=prefix)
 
     @torch.no_grad()
@@ -535,6 +736,25 @@ class LlamaForCausalLM(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> LogitsProcessorOutput:
+        """
+        模型主前向传播（no_grad 模式，纯推理）。
+
+        流程: LlamaModel -> (可选 aux_hidden_states 拆分) ->
+        LogitsProcessor（末 rank）或 PPProxyTensors（非末 rank）。
+
+        Args:
+            input_ids: 输入 token ID，shape [num_tokens]。
+            positions: token 位置索引。
+            forward_batch: 前向批次元数据。
+            input_embeds: 预计算输入嵌入，优先级高于 input_ids。
+            get_embedding: 是否仅返回 pooling 后的嵌入。
+            pp_proxy_tensors: PP 中间结果（非首 rank 使用）。
+
+        Returns:
+            LogitsProcessorOutput（末 rank 且非 embedding 模式），
+            Pooler 输出（末 rank 且 embedding 模式），
+            或 PPProxyTensors（非末 rank）。
+        """
         hidden_states = self.model(
             input_ids,
             positions,
@@ -570,6 +790,22 @@ class LlamaForCausalLM(nn.Module):
         split_interval: Tuple[int, int],  # [start, end) 0-based
         input_embeds: torch.Tensor = None,
     ) -> Optional[LogitsProcessorOutput]:
+        """
+        分片 prefill 前向传播。
+
+        将 prefill 按层切分为多个片段，逐步执行 embedding + 若干 decoder layers。
+        用于分块 prefill 场景，避免单次 prefill 显存溢出。
+
+        Args:
+            input_ids: 输入 token ID。
+            positions: token 位置索引。
+            forward_batch: 前向批次（会原地更新 hidden_states 和 residual）。
+            split_interval: 层区间 [start, end)，0-based。
+            input_embeds: 预计算嵌入。
+
+        Returns:
+            如果 end == num_hidden_layers 则返回 LogitsProcessorOutput，否则 None。
+        """
         start, end = split_interval
         # embed
         if start == 0:
@@ -604,16 +840,30 @@ class LlamaForCausalLM(nn.Module):
 
     @property
     def start_layer(self):
+        """PP 分片中的起始层索引。"""
         return self.model.start_layer
 
     @property
     def end_layer(self):
+        """PP 分片中的结束层索引。"""
         return self.model.end_layer
 
     def get_input_embeddings(self) -> nn.Embedding:
+        """获取模型的输入词嵌入层。"""
         return self.model.embed_tokens
 
     def get_module_name_from_weight_name(self, name):
+        """
+        根据权重文件中的参数名反推模型中的模块名。
+
+        处理融合参数映射（如 q_proj -> qkv_proj），剥离 ".weight" 后缀。
+
+        Args:
+            name: 权重文件中的完整参数名。
+
+        Returns:
+            (module_name, num_shards) 元组。
+        """
         for param_name, weight_name, shard_id, num_shard in self.stacked_params_mapping:
             if weight_name in name:
                 return (
@@ -623,10 +873,28 @@ class LlamaForCausalLM(nn.Module):
         return name[: -len(".weight")], 1
 
     def get_num_params(self):
+        """
+        获取模型参数总数。
+
+        Returns:
+            具名参数的数量。
+        """
         params_dict = dict(self.named_parameters())
         return len(params_dict)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        """
+        从 checkpoint 加载权重。
+
+        处理流程:
+        1. 跳过非当前 PP rank 的层、rotary_emb 缓存、vision_tower、tie-weight 冲突项。
+        2. 尝试将 checkpoint 中的分片名（q_proj/k_proj/v_proj）映射到模型中的
+           融合参数名（qkv_proj），通过 param.weight_loader 做分片加载。
+        3. 未匹配映射规则的参数直接加载。
+
+        Args:
+            weights: (参数名, 权重张量) 的迭代器。
+        """
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -702,10 +970,20 @@ class LlamaForCausalLM(nn.Module):
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100, tp_size: int = 1
     ) -> Optional[torch.Tensor]:
-        """Get the weights of the parameter by its name. Similar to `get_parameter` in Hugging Face.
+        """
+        按参数名获取权重值。类似 HuggingFace 的 get_parameter。
 
-        Only used for unit test with an unoptimized performance.
-        For optimized performance, please use torch.save and torch.load.
+        仅用于单元测试，性能未优化。生产环境请使用 torch.save/load。
+
+        处理 tie_word_embeddings、融合参数反切片、TP 下的 all-gather 聚合。
+
+        Args:
+            name: 参数名（权重文件中的命名）。
+            truncate_size: 截断返回前 N 个元素。
+            tp_size: 用于反切片的 TP 大小。
+
+        Returns:
+            权重值的 list，或出错时返回 None。
         """
         try:
             if name == "lm_head.weight" and self.config.tie_word_embeddings:
@@ -773,9 +1051,22 @@ class LlamaForCausalLM(nn.Module):
             return None
 
     def get_embed_and_head(self):
+        """
+        获取词嵌入权重和 lm_head 权重。
+
+        Returns:
+            (embed_tokens.weight, lm_head.weight) 元组。
+        """
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
+        """
+        原地替换词嵌入和 lm_head 权重，并清空 GPU 缓存。
+
+        Args:
+            embed: 新的词嵌入权重张量。
+            head: 新的 lm_head 权重张量。
+        """
         del self.model.embed_tokens.weight
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
@@ -788,9 +1079,19 @@ class LlamaForCausalLM(nn.Module):
             torch.cuda.synchronize()
 
     def get_embed(self):
+        """获取词嵌入权重。"""
         return self.model.embed_tokens.weight
 
     def set_embed(self, embed):
+        """
+        替换词嵌入权重。
+
+        当草稿模型的 hidden_size 与目标模型不一致时（EAGLE3 场景），
+        跳过替换以避免维度冲突。
+
+        Args:
+            embed: 新的词嵌入权重张量。
+        """
         # NOTE: If draft hidden size != target hidden size, the embed weight cannot be shared for EAGLE3
         if (
             hasattr(self.config, "target_hidden_size")
@@ -807,9 +1108,21 @@ class LlamaForCausalLM(nn.Module):
             torch.cuda.synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        """委托给 LlamaModel 加载 KV cache 量化缩放因子。"""
         self.model.load_kv_cache_scales(quantization_param_path)
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        """
+        配置 EAGLE3 投机解码所需的辅助隐藏状态捕获层。
+
+        SGLang 中第 i 层捕获的是第 (i-1) 层的输出作为 aux hidden state，
+        因此传入的 layer_ids 会自动 +1。
+
+        默认捕获层: [2, num_layers//2, num_layers-3]。
+
+        Args:
+            layer_ids: 需要捕获的层索引列表，为 None 时使用默认值。
+        """
         if not self.pp_group.is_last_rank:
             return
 
@@ -824,6 +1137,17 @@ class LlamaForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        """
+        配置 DLFlash 辅助隐藏状态捕获层。
+
+        与 EAGLE3 类似，layer_ids 会自动 +1。
+
+        Args:
+            layer_ids: 需要捕获的层索引列表。
+
+        Raises:
+            ValueError: layer_ids 为 None 时（DLFlash 不支持默认值）。
+        """
         if not self.pp_group.is_last_rank:
             return
 
